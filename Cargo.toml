@@ -2,16 +2,16 @@
 name = "gasbench"
 version = "0.1.0"
 edition = "2021"
-description = "Gas benchmarking tool for smart contract functions"
+description = "Gas benchmarking tool for EVM smart contracts"
 license = "MIT"
+readme = "README.md"
+repository = "https://github.com/0xHorirami/gasbench"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-ethers = "2"
+ethers = { version = "2", features = ["abigen"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tabled = "0.15"
-eyre = "0.6"
-colored = "2"
-hex = "0.4"
+anyhow = "1"

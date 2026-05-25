@@ -1,497 +1,411 @@
+use anyhow::{anyhow, Result};
+use ethers::abi::{Abi, ParamType, Token};
 use ethers::prelude::*;
-use eyre::{Result, WrapErr};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::str::FromStr;
+use std::sync::Arc;
 use tabled::{Table, Tabled};
 
-/// Result of a single gas benchmark run
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BenchmarkResult {
-    pub function_name: String,
-    pub iteration: u32,
-    pub gas_used: u64,
-    pub success: bool,
-    pub error: Option<String>,
+/// Configuration for a benchmark run.
+#[derive(Debug, Clone)]
+pub struct BenchmarkConfig {
+    pub contract_address: String,
+    pub rpc_url: String,
+    pub functions: Option<Vec<String>>,
+    pub iterations: usize,
 }
 
-/// Aggregated stats for a function across all iterations
-#[derive(Debug, Clone, Serialize, Deserialize, Tabled)]
-pub struct FunctionStats {
+/// Result of a single function call benchmark.
+#[derive(Debug, Clone, Serialize)]
+pub struct FunctionBenchmark {
     pub function_name: String,
-    pub iterations: u32,
+    pub gas_used: Vec<u64>,
+    pub avg_gas: u64,
     pub min_gas: u64,
     pub max_gas: u64,
-    pub avg_gas: f64,
-    pub median_gas: u64,
     pub std_dev: f64,
+    pub anomaly_detected: bool,
 }
 
-/// Optimization suggestion for a function
-#[derive(Debug, Clone, Tabled)]
-pub struct OptimizationSuggestion {
-    pub function_name: String,
-    pub severity: String,
-    pub suggestion: String,
-}
-
-/// ABI function parameter type
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionParam {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub param_type: String,
-    pub value: serde_json::Value,
-}
-
-/// ABI function entry for benchmarking
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FunctionEntry {
-    pub name: String,
-    pub inputs: Vec<FunctionParam>,
-    #[serde(default)]
-    pub state_mutability: String,
-}
-
-/// Benchmark configuration
+/// Snapshot of a function's info collected from the ABI before borrowing ends.
 #[derive(Debug, Clone)]
-pub struct BenchConfig {
-    pub contract_address: Address,
-    pub rpc_url: String,
-    pub iterations: u32,
-    pub functions: Vec<FunctionEntry>,
+pub struct FunctionInfo {
+    pub name: String,
+    pub input_types: Vec<ParamType>,
 }
 
-impl BenchConfig {
-    pub fn new(
-        contract_address: &str,
-        rpc_url: &str,
-        iterations: u32,
-        functions: Vec<FunctionEntry>,
-    ) -> Result<Self> {
-        Ok(Self {
-            contract_address: Address::from_str(contract_address)
-                .wrap_err("Invalid contract address")?,
-            rpc_url: rpc_url.to_string(),
-            iterations,
-            functions,
-        })
-    }
+#[derive(Tabled)]
+struct BenchmarkRow {
+    #[tabled(rename = "Function")]
+    function: String,
+    #[tabled(rename = "Avg Gas")]
+    avg_gas: String,
+    #[tabled(rename = "Min")]
+    min_gas: String,
+    #[tabled(rename = "Max")]
+    max_gas: String,
+    #[tabled(rename = "Std Dev")]
+    std_dev: String,
+    #[tabled(rename = "Anomaly")]
+    anomaly: String,
 }
 
-/// Run benchmarks for all configured functions
-pub async fn run_benchmarks(config: &BenchConfig) -> Result<Vec<BenchmarkResult>> {
-    let provider = Provider::<Http>::try_from(&config.rpc_url)
-        .wrap_err("Failed to connect to RPC endpoint")?;
-
-    let mut all_results = Vec::new();
-
-    for func in &config.functions {
-        for iteration in 0..config.iterations {
-            let result = benchmark_function(&provider, config, func, iteration).await;
-            all_results.push(result);
-        }
-    }
-
-    Ok(all_results)
+/// Generate default sample tokens for common EVM param types.
+fn sample_tokens(param_types: &[ParamType]) -> Vec<Token> {
+    param_types
+        .iter()
+        .map(sample_token_for_type)
+        .collect()
 }
 
-/// Benchmark a single function call
-async fn benchmark_function(
-    provider: &Provider<Http>,
-    config: &BenchConfig,
-    func: &FunctionEntry,
-    iteration: u32,
-) -> BenchmarkResult {
-    let call_result = async {
-        // Build function ABI
-        let inputs: Vec<(String, ethers::abi::ParamType)> = func
-            .inputs
-            .iter()
-            .map(|p| {
-                let pt = parse_param_type(&p.param_type)?;
-                Ok((p.name.clone(), pt))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let func_abi = ethers::abi::Function {
-            name: func.name.clone(),
-            inputs: inputs
-                .iter()
-                .map(|(name, pt)| ethers::abi::Param {
-                    name: name.clone(),
-                    kind: pt.clone(),
-                    internal_type: None,
-                })
-                .collect(),
-            outputs: vec![],
-            constant: false,
-            state_mutability: ethers::abi::StateMutability::NonPayable,
-        };
-
-        // Encode function call
-        let tokens: Vec<ethers::abi::Token> = func
-            .inputs
-            .iter()
-            .zip(func_abi.inputs.iter())
-            .map(|(param, abi_param)| json_to_token(&param.value, &abi_param.kind))
-            .collect::<Result<Vec<_>>>()?;
-
-        let data = func_abi.encode_input(&tokens)?;
-
-        let tx = TransactionRequest::new()
-            .to(config.contract_address)
-            .data(data);
-
-        let gas = provider
-            .estimate_gas(&tx.into(), None)
-            .await
-            .wrap_err("Gas estimation failed")?;
-
-        Ok::<u64, eyre::Report>(gas.as_u64())
-    }
-    .await;
-
-    match call_result {
-        Ok(gas_used) => BenchmarkResult {
-            function_name: func.name.clone(),
-            iteration,
-            gas_used,
-            success: true,
-            error: None,
-        },
-        Err(e) => BenchmarkResult {
-            function_name: func.name.clone(),
-            iteration,
-            gas_used: 0,
-            success: false,
-            error: Some(e.to_string()),
-        },
-    }
-}
-
-/// Parse a Solidity type string into ParamType
-pub fn parse_param_type(ty: &str) -> Result<ethers::abi::ParamType> {
-    match ty {
-        "address" => Ok(ethers::abi::ParamType::Address),
-        "bool" => Ok(ethers::abi::ParamType::Bool),
-        "string" => Ok(ethers::abi::ParamType::String),
-        "bytes" => Ok(ethers::abi::ParamType::Bytes),
-        "uint256" | "uint" => Ok(ethers::abi::ParamType::Uint(256)),
-        "int256" | "int" => Ok(ethers::abi::ParamType::Int(256)),
-        "uint128" => Ok(ethers::abi::ParamType::Uint(128)),
-        "uint64" => Ok(ethers::abi::ParamType::Uint(64)),
-        "uint32" => Ok(ethers::abi::ParamType::Uint(32)),
-        "uint8" => Ok(ethers::abi::ParamType::Uint(8)),
-        "int128" => Ok(ethers::abi::ParamType::Int(128)),
-        "int64" => Ok(ethers::abi::ParamType::Int(64)),
-        "int32" => Ok(ethers::abi::ParamType::Int(32)),
-        "int8" => Ok(ethers::abi::ParamType::Int(8)),
-        "bytes32" => Ok(ethers::abi::ParamType::FixedBytes(32)),
-        "bytes1" => Ok(ethers::abi::ParamType::FixedBytes(1)),
-        ty if ty.starts_with("uint") && ty.ends_with(']') => {
-            Ok(ethers::abi::ParamType::Uint(256)) // simplified
-        }
-        _ => eyre::bail!("Unsupported param type: {}", ty),
-    }
-}
-
-/// Convert a JSON value to an ABI token
-pub fn json_to_token(
-    value: &serde_json::Value,
-    param_type: &ethers::abi::ParamType,
-) -> Result<ethers::abi::Token> {
-    use ethers::abi::{ParamType, Token};
+fn sample_token_for_type(param_type: &ParamType) -> Token {
     match param_type {
         ParamType::Address => {
-            let s = value.as_str().ok_or_else(|| eyre::eyre!("Expected string for address"))?;
-            Ok(Token::Address(Address::from_str(s)?))
+            Token::Address(Address::from_str("0x0000000000000000000000000000000000000001").unwrap())
         }
-        ParamType::Uint(_) => {
-            if let Some(n) = value.as_u64() {
-                Ok(Token::Uint(U256::from(n)))
-            } else if let Some(s) = value.as_str() {
-                Ok(Token::Uint(U256::from_dec_str(s)?))
-            } else {
-                eyre::bail!("Expected number or string for uint")
-            }
-        }
-        ParamType::Int(_) => {
-            if let Some(n) = value.as_i64() {
-                Ok(Token::Int(I256::from(n).into()))
-            } else if let Some(s) = value.as_str() {
-                Ok(Token::Int(I256::from_dec_str(s)?.into()))
-            } else {
-                eyre::bail!("Expected number or string for int")
-            }
-        }
-        ParamType::Bool => {
-            let b = value.as_bool().ok_or_else(|| eyre::eyre!("Expected bool"))?;
-            Ok(Token::Bool(b))
-        }
-        ParamType::String => {
-            let s = value.as_str().ok_or_else(|| eyre::eyre!("Expected string"))?;
-            Ok(Token::String(s.to_string()))
-        }
-        ParamType::Bytes => {
-            let s = value.as_str().ok_or_else(|| eyre::eyre!("Expected hex string for bytes"))?;
-            let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))?;
-            Ok(Token::Bytes(bytes))
-        }
+        ParamType::Uint(_bits) => Token::Uint(1u64.into()),
+        ParamType::Int(_bits) => Token::Int(1i64.into()),
+        ParamType::Bool => Token::Bool(true),
+        ParamType::String => Token::String("benchmark".to_string()),
+        ParamType::Bytes => Token::Bytes(vec![0u8; 32]),
         ParamType::FixedBytes(n) => {
-            let s = value.as_str().ok_or_else(|| eyre::eyre!("Expected hex string for bytesN"))?;
-            let bytes = hex::decode(s.strip_prefix("0x").unwrap_or(s))?;
-            let mut fixed = [0u8; 32];
-            let len = bytes.len().min(*n).min(32);
-            fixed[..len].copy_from_slice(&bytes[..len]);
-            Ok(Token::FixedBytes(fixed.to_vec()))
+            let mut b = vec![0u8; *n];
+            if *n > 0 { b[0] = 1; }
+            Token::FixedBytes(b)
         }
-        _ => eyre::bail!("Unsupported param type for token conversion"),
+        ParamType::Array(inner) => {
+            Token::Array(vec![sample_token_for_type(inner)])
+        }
+        ParamType::FixedArray(inner, size) => {
+            let items: Vec<Token> = (0..*size).map(|_| sample_token_for_type(inner)).collect();
+            Token::FixedArray(items)
+        }
+        ParamType::Tuple(fields) => {
+            Token::Tuple(fields.iter().map(|f| sample_token_for_type(f)).collect())
+        }
     }
 }
 
-/// Compute statistics for benchmark results
-pub fn compute_stats(results: &[BenchmarkResult]) -> Vec<FunctionStats> {
-    use std::collections::HashMap;
-    let mut groups: HashMap<String, Vec<u64>> = HashMap::new();
+/// Enumerate all functions from the ABI as owned FunctionInfo, optionally filtered by name.
+pub fn get_function_infos(abi: &Abi, filter: &Option<Vec<String>>) -> Vec<FunctionInfo> {
+    abi.functions()
+        .map(|func| FunctionInfo {
+            name: func.name.clone(),
+            input_types: func.inputs.iter().map(|p| p.kind.clone()).collect(),
+        })
+        .filter(|info| {
+            match filter {
+                Some(names) => names.iter().any(|n| n == &info.name),
+                None => true,
+            }
+        })
+        .collect()
+}
 
-    for r in results {
-        if r.success {
-            groups.entry(r.function_name.clone()).or_default().push(r.gas_used);
+/// Compute mean of a slice.
+pub fn mean(data: &[u64]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    data.iter().sum::<u64>() as f64 / data.len() as f64
+}
+
+/// Compute standard deviation.
+pub fn std_dev(data: &[u64]) -> f64 {
+    if data.len() < 2 {
+        return 0.0;
+    }
+    let avg = mean(data);
+    let variance = data
+        .iter()
+        .map(|v| {
+            let diff = *v as f64 - avg;
+            diff * diff
+        })
+        .sum::<f64>()
+        / data.len() as f64;
+    variance.sqrt()
+}
+
+/// Detect anomalies: any value > 2 standard deviations from the mean.
+pub fn detect_anomaly(data: &[u64]) -> bool {
+    if data.len() < 3 {
+        return false;
+    }
+    let avg = mean(data);
+    let sd = std_dev(data);
+    if sd == 0.0 {
+        return false;
+    }
+    data.iter().any(|v| (*v as f64 - avg).abs() > 2.0 * sd)
+}
+
+/// Format the benchmark report as a table string.
+fn format_report(results: &[FunctionBenchmark]) -> String {
+    let rows: Vec<BenchmarkRow> = results
+        .iter()
+        .map(|r| BenchmarkRow {
+            function: r.function_name.clone(),
+            avg_gas: format!("{}", r.avg_gas),
+            min_gas: format!("{}", r.min_gas),
+            max_gas: format!("{}", r.max_gas),
+            std_dev: format!("{:.2}", r.std_dev),
+            anomaly: if r.anomaly_detected { "⚠ YES" } else { "✓ No" }.to_string(),
+        })
+        .collect();
+
+    if rows.is_empty() {
+        return "No functions benchmarked.".to_string();
+    }
+
+    let table = Table::new(rows).to_string();
+
+    let mut report = String::new();
+    report.push_str("\n=== GasBench Report ===\n\n");
+    report.push_str(&table);
+    report.push('\n');
+
+    // Summary
+    let total_avg: u64 = results.iter().map(|r| r.avg_gas).sum();
+    let anomaly_count = results.iter().filter(|r| r.anomaly_detected).count();
+    report.push_str(&format!(
+        "\nFunctions benchmarked: {}\nTotal avg gas: {}\nAnomalies detected: {}\n",
+        results.len(),
+        total_avg,
+        anomaly_count
+    ));
+
+    if anomaly_count > 0 {
+        report.push_str("\n⚠ Optimization suggestions:\n");
+        for r in results.iter().filter(|r| r.anomaly_detected) {
+            report.push_str(&format!(
+                "  - `{}`: high gas variance (std_dev={:.2}), consider optimizing storage writes or loop bounds.\n",
+                r.function_name, r.std_dev
+            ));
         }
     }
 
-    let mut stats = Vec::new();
-    for (name, mut values) in groups {
-        values.sort_unstable();
-        let count = values.len() as u32;
-        let min = *values.first().unwrap_or(&0);
-        let max = *values.last().unwrap_or(&0);
-        let sum: u64 = values.iter().sum();
-        let avg = sum as f64 / count as f64;
-        let median = values[count as usize / 2];
+    report
+}
 
-        let variance = values.iter().map(|&v| {
-            let diff = v as f64 - avg;
-            diff * diff
-        }).sum::<f64>() / count as f64;
-        let std_dev = variance.sqrt();
+/// Run the full benchmark pipeline.
+pub async fn run_benchmark(config: BenchmarkConfig) -> Result<String> {
+    let provider = Provider::<Http>::try_from(&config.rpc_url)
+        .map_err(|e| anyhow!("Failed to connect to RPC at {}: {}", config.rpc_url, e))?;
+    let client = Arc::new(provider);
 
-        stats.push(FunctionStats {
-            function_name: name,
-            iterations: count,
+    let address = Address::from_str(&config.contract_address)
+        .map_err(|e| anyhow!("Invalid contract address '{}': {}", config.contract_address, e))?;
+
+    // Load ABI. For a production tool you'd load from a file or explorer API.
+    // Here we use a built-in minimal ERC-20 ABI for demonstration.
+    let abi: Abi = serde_json::from_str(ERC20_ABI_JSON)
+        .map_err(|e| anyhow!("Failed to parse built-in ABI: {}", e))?;
+
+    // Collect function info before moving abi into the contract
+    let function_infos = get_function_infos(&abi, &config.functions);
+
+    if function_infos.is_empty() {
+        return Err(anyhow!("No matching functions found in ABI."));
+    }
+
+    let contract = Contract::new(address, abi, client.clone());
+    let mut results: Vec<FunctionBenchmark> = Vec::new();
+
+    for info in &function_infos {
+        let sample_args = sample_tokens(&info.input_types);
+        let mut gas_values: Vec<u64> = Vec::new();
+
+        for _ in 0..config.iterations {
+            let call = contract.method::<_, ()>(&info.name, sample_args.clone());
+            match call {
+                Ok(pending) => {
+                    match pending.estimate_gas().await {
+                        Ok(gas) => {
+                            gas_values.push(gas.as_u64());
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: gas estimation failed for `{}`: {} — recording 0",
+                                info.name, e
+                            );
+                            gas_values.push(0);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: could not build call for `{}`: {}", info.name, e);
+                    gas_values.push(0);
+                }
+            }
+        }
+
+        let anomaly = detect_anomaly(&gas_values);
+        let avg = mean(&gas_values) as u64;
+        let min = *gas_values.iter().min().unwrap_or(&0);
+        let max = *gas_values.iter().max().unwrap_or(&0);
+        let sd = std_dev(&gas_values);
+
+        results.push(FunctionBenchmark {
+            function_name: info.name.clone(),
+            gas_used: gas_values,
+            avg_gas: avg,
             min_gas: min,
             max_gas: max,
-            avg_gas: avg,
-            median_gas: median,
-            std_dev,
+            std_dev: sd,
+            anomaly_detected: anomaly,
         });
     }
 
-    stats.sort_by(|a, b| b.avg_gas.partial_cmp(&a.avg_gas).unwrap_or(std::cmp::Ordering::Equal));
-    stats
+    Ok(format_report(&results))
 }
 
-/// Generate optimization suggestions based on stats
-pub fn generate_suggestions(stats: &[FunctionStats]) -> Vec<OptimizationSuggestion> {
-    let mut suggestions = Vec::new();
-
-    for s in stats {
-        // High variance suggests inconsistent execution paths
-        if s.std_dev > s.avg_gas * 0.2 && s.iterations > 2 {
-            suggestions.push(OptimizationSuggestion {
-                function_name: s.function_name.clone(),
-                severity: "WARN".to_string(),
-                suggestion: format!(
-                    "High gas variance ({:.1} std dev vs {:.1} avg). Consider using require() \
-                     guards earlier to fail fast, or review conditional branching.",
-                    s.std_dev, s.avg_gas
-                ),
-            });
-        }
-
-        // Very high gas usage
-        if s.avg_gas > 500_000.0 {
-            suggestions.push(OptimizationSuggestion {
-                function_name: s.function_name.clone(),
-                severity: "HIGH".to_string(),
-                suggestion: "Gas exceeds 500k. Consider: using mappings over arrays, \
-                    batching operations, or splitting into multiple transactions."
-                    .to_string(),
-            });
-        } else if s.avg_gas > 200_000.0 {
-            suggestions.push(OptimizationSuggestion {
-                function_name: s.function_name.clone(),
-                severity: "MED".to_string(),
-                suggestion: "Gas exceeds 200k. Consider: packing storage variables, \
-                    using unchecked blocks for safe arithmetic, or caching storage reads."
-                    .to_string(),
-            });
-        }
-
-        // General suggestions for any function
-        if s.avg_gas > 50_000.0 && suggestions.iter().filter(|sg| sg.function_name == s.function_name).count() == 0 {
-            suggestions.push(OptimizationSuggestion {
-                function_name: s.function_name.clone(),
-                severity: "INFO".to_string(),
-                suggestion: "Consider using calldata instead of memory for read-only \
-                    function parameters to save gas.".to_string(),
-            });
-        }
+/// Minimal ERC-20 ABI used when no external ABI file is provided.
+const ERC20_ABI_JSON: &str = r#"[
+    {
+        "type": "function",
+        "name": "totalSupply",
+        "inputs": [],
+        "outputs": [{"name":"","type":"uint256"}],
+        "stateMutability": "view"
+    },
+    {
+        "type": "function",
+        "name": "balanceOf",
+        "inputs": [{"name":"account","type":"address"}],
+        "outputs": [{"name":"","type":"uint256"}],
+        "stateMutability": "view"
+    },
+    {
+        "type": "function",
+        "name": "transfer",
+        "inputs": [{"name":"recipient","type":"address"},{"name":"amount","type":"uint256"}],
+        "outputs": [{"name":"","type":"bool"}],
+        "stateMutability": "nonpayable"
+    },
+    {
+        "type": "function",
+        "name": "allowance",
+        "inputs": [{"name":"owner","type":"address"},{"name":"spender","type":"address"}],
+        "outputs": [{"name":"","type":"uint256"}],
+        "stateMutability": "view"
+    },
+    {
+        "type": "function",
+        "name": "approve",
+        "inputs": [{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],
+        "outputs": [{"name":"","type":"bool"}],
+        "stateMutability": "nonpayable"
+    },
+    {
+        "type": "function",
+        "name": "transferFrom",
+        "inputs": [{"name":"sender","type":"address"},{"name":"recipient","type":"address"},{"name":"amount","type":"uint256"}],
+        "outputs": [{"name":"","type":"bool"}],
+        "stateMutability": "nonpayable"
+    },
+    {
+        "type": "function",
+        "name": "name",
+        "inputs": [],
+        "outputs": [{"name":"","type":"string"}],
+        "stateMutability": "view"
+    },
+    {
+        "type": "function",
+        "name": "symbol",
+        "inputs": [],
+        "outputs": [{"name":"","type":"string"}],
+        "stateMutability": "view"
+    },
+    {
+        "type": "function",
+        "name": "decimals",
+        "inputs": [],
+        "outputs": [{"name":"","type":"uint8"}],
+        "stateMutability": "view"
     }
-
-    if suggestions.is_empty() {
-        suggestions.push(OptimizationSuggestion {
-            function_name: "*".to_string(),
-            severity: "OK".to_string(),
-            suggestion: "All functions appear reasonably gas-efficient.".to_string(),
-        });
-    }
-
-    suggestions
-}
-
-/// Print a formatted benchmark report
-pub fn print_report(stats: &[FunctionStats], suggestions: &[OptimizationSuggestion]) {
-    use colored::Colorize;
-
-    println!("\n{}", "╔══════════════════════════════════════════════════════════════╗".cyan());
-    println!("{}", "║               ⛽  GASBENCH REPORT                           ║".cyan());
-    println!("{}", "╚══════════════════════════════════════════════════════════════╝".cyan());
-
-    println!("\n{}", "── Gas Statistics ──────────────────────────────────────────────".bold());
-    if stats.is_empty() {
-        println!("  No successful benchmark results.");
-    } else {
-        let table = Table::new(stats).to_string();
-        println!("{}", table);
-    }
-
-    println!("\n{}", "── Optimization Suggestions ───────────────────────────────────".bold());
-    if suggestions.is_empty() {
-        println!("  No suggestions.");
-    } else {
-        let table = Table::new(suggestions).to_string();
-        println!("{}", table);
-    }
-
-    println!();
-}
+]"#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn test_parse_param_type_common() {
-        assert!(matches!(parse_param_type("address").unwrap(), ethers::abi::ParamType::Address));
-        assert!(matches!(parse_param_type("bool").unwrap(), ethers::abi::ParamType::Bool));
-        assert!(matches!(parse_param_type("string").unwrap(), ethers::abi::ParamType::String));
-        assert!(matches!(parse_param_type("uint256").unwrap(), ethers::abi::ParamType::Uint(256)));
-        assert!(matches!(parse_param_type("int256").unwrap(), ethers::abi::ParamType::Int(256)));
-        assert!(matches!(parse_param_type("bytes32").unwrap(), ethers::abi::ParamType::FixedBytes(32)));
-        assert!(parse_param_type("totally_invalid").is_err());
+    fn test_mean_basic() {
+        let data = vec![100, 200, 300];
+        let m = mean(&data);
+        assert!((m - 200.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_json_to_token_address() {
-        let addr = "0x0000000000000000000000000000000000000001";
-        let token = json_to_token(&json!(addr), &ethers::abi::ParamType::Address).unwrap();
+    fn test_mean_empty() {
+        let data: Vec<u64> = vec![];
+        assert_eq!(mean(&data), 0.0);
+    }
+
+    #[test]
+    fn test_std_dev_zero() {
+        let data = vec![500, 500, 500];
+        assert!((std_dev(&data) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_std_dev_nonzero() {
+        let data = vec![100, 200, 300];
+        let sd = std_dev(&data);
+        assert!(sd > 80.0 && sd < 83.0); // ~81.65
+    }
+
+    #[test]
+    fn test_detect_anomaly_false_for_consistent_data() {
+        let data = vec![21000, 21000, 21000, 21000, 21000];
+        assert!(!detect_anomaly(&data));
+    }
+
+    #[test]
+    fn test_detect_anomaly_true_for_spike() {
+        let data = vec![21000, 21000, 21000, 21000, 21000, 21000, 21000, 21000, 21000, 500000];
+        assert!(detect_anomaly(&data));
+    }
+
+    #[test]
+    fn test_detect_anomaly_insufficient_data() {
+        let data = vec![21000, 210000];
+        assert!(!detect_anomaly(&data)); // less than 3 data points
+    }
+
+    #[test]
+    fn test_sample_token_address() {
+        let token = sample_token_for_type(&ParamType::Address);
         match token {
-            ethers::abi::Token::Address(a) => assert_eq!(a, Address::from_str(addr).unwrap()),
+            Token::Address(_) => {}
             _ => panic!("Expected Address token"),
         }
     }
 
     #[test]
-    fn test_json_to_token_uint() {
-        let token = json_to_token(&json!(42), &ethers::abi::ParamType::Uint(256)).unwrap();
+    fn test_sample_token_uint() {
+        let token = sample_token_for_type(&ParamType::Uint(256));
         match token {
-            ethers::abi::Token::Uint(n) => assert_eq!(n, U256::from(42)),
+            Token::Uint(v) => assert_eq!(v.as_u64(), 1),
             _ => panic!("Expected Uint token"),
         }
     }
 
     #[test]
-    fn test_json_to_token_string() {
-        let token = json_to_token(&json!("hello"), &ethers::abi::ParamType::String).unwrap();
-        match token {
-            ethers::abi::Token::String(s) => assert_eq!(s, "hello"),
-            _ => panic!("Expected String token"),
-        }
+    fn test_get_function_infos_with_filter() {
+        let abi: Abi = serde_json::from_str(ERC20_ABI_JSON).unwrap();
+        let filter = Some(vec!["transfer".to_string()]);
+        let funcs = get_function_infos(&abi, &filter);
+        assert_eq!(funcs.len(), 1);
+        assert_eq!(funcs[0].name, "transfer");
     }
 
     #[test]
-    fn test_compute_stats() {
-        let results = vec![
-            BenchmarkResult {
-                function_name: "transfer".to_string(),
-                iteration: 0,
-                gas_used: 21000,
-                success: true,
-                error: None,
-            },
-            BenchmarkResult {
-                function_name: "transfer".to_string(),
-                iteration: 1,
-                gas_used: 21000,
-                success: true,
-                error: None,
-            },
-            BenchmarkResult {
-                function_name: "transfer".to_string(),
-                iteration: 2,
-                gas_used: 0,
-                success: false,
-                error: Some("fail".to_string()),
-            },
-        ];
-
-        let stats = compute_stats(&results);
-        assert_eq!(stats.len(), 1);
-        assert_eq!(stats[0].function_name, "transfer");
-        assert_eq!(stats[0].iterations, 2);
-        assert_eq!(stats[0].min_gas, 21000);
-        assert_eq!(stats[0].max_gas, 21000);
-        assert_eq!(stats[0].avg_gas, 21000.0);
-    }
-
-    #[test]
-    fn test_generate_suggestions_high_gas() {
-        let stats = vec![FunctionStats {
-            function_name: "expensiveFunc".to_string(),
-            iterations: 5,
-            min_gas: 500_000,
-            max_gas: 600_000,
-            avg_gas: 550_000.0,
-            median_gas: 550_000,
-            std_dev: 10_000.0,
-        }];
-
-        let suggestions = generate_suggestions(&stats);
-        assert!(!suggestions.is_empty());
-        assert!(suggestions.iter().any(|s| s.severity == "HIGH"));
-    }
-
-    #[test]
-    fn test_generate_suggestions_low_gas() {
-        let stats = vec![FunctionStats {
-            function_name: "cheapFunc".to_string(),
-            iterations: 5,
-            min_gas: 5000,
-            max_gas: 5100,
-            avg_gas: 5050.0,
-            median_gas: 5050,
-            std_dev: 40.0,
-        }];
-
-        let suggestions = generate_suggestions(&stats);
-        assert!(suggestions.iter().any(|s| s.severity == "OK"));
-    }
-
-    #[test]
-    fn test_bench_config_new_invalid_address() {
-        let result = BenchConfig::new("not_an_address", "http://localhost:8545", 3, vec![]);
-        assert!(result.is_err());
+    fn test_get_function_infos_no_filter() {
+        let abi: Abi = serde_json::from_str(ERC20_ABI_JSON).unwrap();
+        let funcs = get_function_infos(&abi, &None);
+        assert!(funcs.len() >= 9); // ERC-20 has 9 functions
     }
 }

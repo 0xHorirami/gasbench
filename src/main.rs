@@ -1,80 +1,41 @@
 use clap::Parser;
-use eyre::Result;
-use gasbench::{self, BenchConfig, FunctionEntry};
-use std::fs;
+use gasbench::{run_benchmark, BenchmarkConfig};
 
-/// GasBench — benchmark gas costs for smart contract functions
+/// GasBench — Gas benchmarking tool for EVM smart contracts
 #[derive(Parser, Debug)]
 #[command(name = "gasbench", version, about, long_about = None)]
-struct Args {
+struct Cli {
     /// Contract address to benchmark
-    #[arg(short, long)]
+    #[arg(long)]
     contract: String,
 
     /// RPC endpoint URL
-    #[arg(short, long, default_value = "http://localhost:8545")]
+    #[arg(long, default_value = "http://localhost:8545")]
     rpc: String,
 
+    /// Comma-separated list of function signatures to benchmark (e.g. "transfer(address,uint256),approve(address,uint256)")
+    /// If omitted, all read/write functions from the ABI will be benchmarked.
+    #[arg(long, value_delimiter = ',')]
+    functions: Option<Vec<String>>,
+
     /// Number of iterations per function
-    #[arg(short, long, default_value_t = 5)]
-    iterations: u32,
-
-    /// Path to JSON file describing functions to benchmark
-    #[arg(short, long)]
-    functions_file: String,
-
-    /// Output results as JSON
-    #[arg(long)]
-    json: bool,
-}
-
-/// Top-level JSON schema for the functions file
-#[derive(serde::Deserialize)]
-struct FunctionsFile {
-    functions: Vec<FunctionEntry>,
+    #[arg(long, default_value_t = 5)]
+    iterations: usize,
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
 
-    println!("⛽ GasBench v{}", env!("CARGO_PKG_VERSION"));
-    println!("   Contract : {}", args.contract);
-    println!("   RPC      : {}", args.rpc);
-    println!("   Iters    : {}", args.iterations);
-    println!("   Functions: {}", args.functions_file);
-    println!();
+    let config = BenchmarkConfig {
+        contract_address: cli.contract,
+        rpc_url: cli.rpc,
+        functions: cli.functions,
+        iterations: cli.iterations,
+    };
 
-    // Load function definitions
-    let file_content = fs::read_to_string(&args.functions_file)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to read functions file: {e}");
-            std::process::exit(1);
-        });
-    let funcs_file: FunctionsFile = serde_json::from_str(&file_content)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to parse functions JSON: {e}");
-            std::process::exit(1);
-        });
-
-    let config = BenchConfig::new(
-        &args.contract,
-        &args.rpc,
-        args.iterations,
-        funcs_file.functions,
-    )?;
-
-    println!("Running benchmarks...");
-    let results = gasbench::run_benchmarks(&config).await?;
-
-    let stats = gasbench::compute_stats(&results);
-    let suggestions = gasbench::generate_suggestions(&stats);
-
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&stats)?);
-    } else {
-        gasbench::print_report(&stats, &suggestions);
-    }
+    let report = run_benchmark(config).await?;
+    println!("{}", report);
 
     Ok(())
 }
