@@ -1,0 +1,19 @@
+{
+  "functions": [
+    {
+      "name": "transfer",
+      "state_mutability": "nonpayable",
+      "inputs": [
+        { "name": "to", "type": "address", "value": "0x0000000000000000000000000000000000000001" },
+        { "name": "amount", "type": "uint256", "value": "1000000000000000000" }
+      ]
+    },
+    {
+      "name": "balanceOf",
+      "state_mutability": "view",
+      "inputs": [
+        { "name": "account", "type": "address", "value": "0x0000000000000000000000000000000000000001" }
+      ]
+    }
+  ]
+}
